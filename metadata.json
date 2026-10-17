@@ -1,6 +1,10 @@
 {
   "name": "Smart Box Counter",
   "description": "Warehouse box counting and inventory inspection with 2D affine matrix inverse cropping, camera capture, and external AI model forwarding",
-  "requestFramePermissions": ["camera"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
