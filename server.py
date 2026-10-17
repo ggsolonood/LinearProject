@@ -26,27 +26,31 @@ from fastapi.responses import HTMLResponse
 import numpy as np
 import cv2
 
-# นำเข้า BoxPredictor (ค้นหาทุกโฟลเดอร์)
+# นำเข้า BoxPredictor จาก predict.py โดยตรง ป้องกันปัญหา Circular Import
+import importlib.util
+
+_ROOT = Path(__file__).resolve().parent
+_ROOT_PREDICT = _ROOT / "predict.py"
+
 BoxPredictor = None
-for import_stmt in [
-    ("predict", "BoxPredictor"),
-    ("model.predict", "BoxPredictor"),
-    ("training.predict", "BoxPredictor"),
-    ("model.training.predict", "BoxPredictor"),
-]:
+
+if _ROOT_PREDICT.exists():
     try:
-        mod = __import__(import_stmt[0], fromlist=[import_stmt[1]])
-        BoxPredictor = getattr(mod, import_stmt[1])
-        break
-    except Exception:
-        pass
+        _spec = importlib.util.spec_from_file_location("parcel_box_root_predict", str(_ROOT_PREDICT))
+        if _spec and _spec.loader:
+            _mod = importlib.util.module_from_spec(_spec)
+            sys.modules["parcel_box_root_predict"] = _mod
+            _spec.loader.exec_module(_mod)
+            BoxPredictor = getattr(_mod, "BoxPredictor", None)
+    except Exception as e:
+        print(f"⚠ Error loading predict.py via spec: {e}")
 
 if BoxPredictor is None:
-    _cur = Path(__file__).resolve().parent
-    for extra_dir in [_cur, _cur / "model", _cur / "model" / "training", _cur / "training"]:
-        if extra_dir.exists() and str(extra_dir) not in sys.path:
-            sys.path.insert(0, str(extra_dir))
-    from predict import BoxPredictor
+    try:
+        sys.path.insert(0, str(_ROOT))
+        from predict import BoxPredictor
+    except Exception as e:
+        print(f"⚠ Error fallback importing BoxPredictor: {e}")
 
 predictor: Optional[BoxPredictor] = None
 model_load_error: Optional[str] = None
