@@ -1,0 +1,22 @@
+{
+  "preprocessing": {
+    "resize_target": [
+      512,
+      512
+    ],
+    "blur_ksize": 5,
+    "clip_percentile": 95.0,
+    "image_size_svd": 128
+  },
+  "training": {
+    "learning_rate": 0.01,
+    "batch_size": 32,
+    "max_epochs": 500,
+    "weight_init": "xavier",
+    "patience": 25
+  },
+  "model": {
+    "k": 8.0,
+    "n_svd_features": 64
+  }
+}
