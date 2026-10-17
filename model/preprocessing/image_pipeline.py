@@ -1,0 +1,214 @@
+# image_pipeline.py — Image Processing Pipeline Orchestrator
+"""
+โมดูลรวมกระบวนการประมวลผลรูปภาพ (Pipeline Orchestrator)
+
+ไฟล์นี้ทำหน้าที่เป็นตัวประสาน (Orchestrator) และรวบรวมองค์ประกอบของ Pipeline 
+ตามข้อกำหนดใน documents/model_training_pipeline.md:
+  1. Data Ingestion & Pre-transformation             → data_ingestion.py
+     (ภาพถูกทำ Geometric Transformation มาแล้วตั้งแต่ขั้นตอนนำเข้าข้อมูลโดยผู้เตรียมข้อมูล)
+  2. Grayscale, Resizing, Gaussian Blur & Edge Map   → edge_processing.py
+  3. SVD Feature Extraction                          → svd_features.py
+  * geometric_transform.py เป็นโมดูลเครื่องมืออิสระและสำหรับใช้งานบน Web App
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+
+# เพิ่ม preprocessing/ เข้า sys.path อัตโนมัติ
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from config import (
+    INPUT_DIR,
+    GRAY_DIR,
+    RESIZED_DIR,
+    BLUR_DIR,
+    CONV_DIR,
+    BASE_DIR,
+    SUPPORTED_EXTENSIONS,
+    TRANSLATE_X,
+    TRANSLATE_Y,
+    SCALE_FACTOR,
+    ROTATION_DEG,
+    MAX_PLOTS,
+    RESIZE_TARGET,
+    BLUR_KSIZE,
+    CLIP_PERCENTILE,
+)
+
+# ── Re-export จากโมดูลย่อย (เพื่อความเข้ากันได้และการเรียกใช้ที่สะดวก) ───────────
+from data_ingestion import (
+    upload_zip,
+    upload_images,
+    collect_image_paths,
+    _collect_image_paths,
+    read_image,
+    load_from_local_paths,
+    load_from_zip_path,
+)
+
+from geometric_transform import (
+    transform_image,
+    translate_image,
+    scale_image,
+    rotate_image,
+)
+
+from edge_processing import (
+    EDGE_KERNEL,
+    to_grayscale,
+    resize_image,
+    apply_gaussian_blur,
+    create_edge_map,
+    process_image_edges,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Pipeline: Process all images
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_images(
+    image_paths: List[Path],
+    resize_target: Tuple[int, int] | int = RESIZE_TARGET,
+    blur_ksize: int = BLUR_KSIZE,
+    clip_percentile: float = CLIP_PERCENTILE,
+    save_intermediate: bool = True,
+    save_viz: bool = True,
+    **kwargs,
+) -> List[Tuple[str, Path]]:
+    """รันกระบวนการประมวลผลรูปภาพแบบ End-to-End
+    Input RGB (Pre-transformed by Ingestion) → Grayscale → Resize → Gaussian Blur → Edge Convolution → บันทึก → Visualize
+
+    หมายเหตุ:
+      ขั้นตอน Geometric Transformation ได้ถูกย้ายไปดำเนินการตั้งแต่ขั้นตอนการนำเข้าข้อมูล
+      (Pre-transformed / Pre-aligned by Data Ingestor) ภาพที่ส่งเข้ามาใน Pipeline นี้จึงพร้อมสำหรับ
+      Grayscale, Resizing, Blur, และ Edge Convolution โดยตรง
+
+    Parameters
+    ----------
+    image_paths       : รายการ Path ของรูปภาพที่ผ่านการนำเข้าและจัดตำแหน่งแล้ว
+    resize_target     : ขนาดที่ต้องการย่อภาพ (width, height) เพื่อความเหมาะสมกับ Kernel 3x3
+    blur_ksize        : ขนาด Gaussian blur kernel เพื่อลด Noise (เช่น 5)
+    clip_percentile   : เปอร์เซ็นไทล์สำหรับตัด Outlier ใน Edge Map (เช่น 98.0)
+    save_intermediate : True = บันทึกไฟล์ภาพของแต่ละขั้นตอน (Resized, Blurred)
+    save_viz          : True = บันทึกภาพ Visualization รวมทุกขั้นตอนลง pipeline_visualizations/
+
+    Returns
+    -------
+    processed : รายการ (original_filename, gray_path) ที่สำเร็จ
+    """
+    # ตรวจสอบและสร้างโฟลเดอร์สำหรับผลลัพธ์ทุกขั้นตอน
+    GRAY_DIR.mkdir(parents=True, exist_ok=True)
+    CONV_DIR.mkdir(parents=True, exist_ok=True)
+    if save_intermediate:
+        RESIZED_DIR.mkdir(parents=True, exist_ok=True)
+        BLUR_DIR.mkdir(parents=True, exist_ok=True)
+
+    viz_dir = (BASE_DIR / "pipeline_visualizations") if save_viz else None
+    if viz_dir:
+        viz_dir.mkdir(parents=True, exist_ok=True)
+
+    processed: List[Tuple[str, Path]] = []
+
+    for path in image_paths:
+        bgr = read_image(path)
+        if bgr is None:
+            print(f"[SKIP] อ่านรูปไม่ได้/รูปว่าง: {path.name}")
+            continue
+
+        # ── Step 1-4: Grayscale, Resize, Blur, Edge Convolution ──────
+        # (ภาพ bgr ผ่านการทำ Geometric Transformation มาแล้วตั้งแต่ขั้นตอนนำเข้าข้อมูล)
+        gray, resized, blurred, edge_map = process_image_edges(
+            bgr,
+            resize_target=resize_target,
+            blur_ksize=blur_ksize,
+            clip_percentile=clip_percentile,
+        )
+
+        # ── บันทึกผลลัพธ์แต่ละขั้นตอน ──────────────────────────────────
+        gray_path = GRAY_DIR / f"gray_{path.name}"
+        conv_path = CONV_DIR / f"conv_{path.name}"
+
+        gray_ok = cv2.imwrite(str(gray_path), gray)
+        conv_ok = cv2.imwrite(str(conv_path), edge_map)
+
+        if save_intermediate:
+            resized_path = RESIZED_DIR / f"resized_{path.name}"
+            blur_path = BLUR_DIR / f"blur_{path.name}"
+            cv2.imwrite(str(resized_path), resized)
+            cv2.imwrite(str(blur_path), blurred)
+
+        if not (gray_ok and conv_ok):
+            print(f"[SKIP] บันทึกผลลัพธ์ไม่สำเร็จ: {path.name}")
+            continue
+
+        processed.append((path.name, gray_path))
+        _maybe_visualize(
+            input_bgr=bgr,
+            gray=gray,
+            resized=resized,
+            blurred=blurred,
+            edge_map=edge_map,
+            title=path.name,
+            count=len(processed),
+            save_dir=viz_dir,
+        )
+
+    print(f"ประมวลผลสำเร็จ: {len(processed)} รูป (บันทึก Grayscale, Resized, Blurred, Convolution)")
+    return processed
+
+
+def _maybe_visualize(
+    input_bgr: np.ndarray,
+    gray: np.ndarray,
+    resized: np.ndarray,
+    blurred: np.ndarray,
+    edge_map: np.ndarray,
+    title: str,
+    count: int,
+    save_dir: Optional[Path] = None,
+) -> None:
+    """แสดงกราฟและบันทึกภาพผลลัพธ์ทุกขั้นตอนใน pipeline แบบ side-by-side (5 คอลัมน์)"""
+    if MAX_PLOTS is not None and count > MAX_PLOTS:
+        return
+
+    fig, axes = plt.subplots(1, 5, figsize=(19, 4))
+    fig.patch.set_facecolor("#0b0f19")
+
+    steps = [
+        (cv2.cvtColor(input_bgr, cv2.COLOR_BGR2RGB), "① Input RGB\n(Pre-transformed)", None, "#4fc3f7"),
+        (gray, "② Grayscale", "gray", "#ffb74d"),
+        (resized, f"③ Resized\n({resized.shape[1]}×{resized.shape[0]})", "gray", "#a78bfa"),
+        (blurred, f"④ Gaussian Blur\n(K={BLUR_KSIZE})", "gray", "#38bdf8"),
+        (edge_map, "⑤ Edge Map\n(Laplacian)", "inferno", "#f48fb1"),
+    ]
+
+    for ax, (img, step_title, cmap, border_color) in zip(axes, steps):
+        kwargs = {"vmin": 0, "vmax": 255} if img.ndim == 2 else {}
+        ax.imshow(img, cmap=cmap, **kwargs)
+        ax.set_title(step_title, color="white", fontsize=9.5, fontweight="bold", pad=8)
+        ax.axis("off")
+        for spine in ax.spines.values():
+            spine.set_edgecolor(border_color)
+            spine.set_linewidth(2.0)
+
+    fig.suptitle(f"Preprocessing Pipeline Steps | {title}", color="white", fontsize=12, fontweight="bold", y=1.02)
+    plt.tight_layout()
+
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        out_path = save_dir / f"pipeline_{Path(title).stem}.png"
+        fig.savefig(out_path, bbox_inches="tight", dpi=120, facecolor=fig.get_facecolor())
+        print(f"  💾 บันทึกภาพขั้นตอน Pipeline → {out_path}")
+
+    plt.show()
+    plt.close(fig)
