@@ -1,0 +1,71 @@
+{
+  "session": "session_20261018_082656",
+  "trained_at": "2026-10-18T08:27:13.703175",
+  "model_type": "multi_class_classification",
+  "dataset": {
+    "n_train_raw": 501,
+    "n_train_effective": 5010,
+    "n_val": 107,
+    "n_test": 108,
+    "train_augmented": true,
+    "val_augmented": false,
+    "test_augmented": false
+  },
+  "champion": {
+    "trial_id": 61,
+    "clip_percentile": 98.0,
+    "learning_rate": 0.01,
+    "batch_size": 32,
+    "hidden_dim": 32,
+    "n_classes": 9,
+    "best_epoch": 62,
+    "stopped_early": true,
+    "total_epochs": 92
+  },
+  "val_metrics": {
+    "cross_entropy": 1.3519345818444892,
+    "acc_exact": 0.5233644859813084,
+    "acc_within_1": 0.719626168224299,
+    "macro_f1": 0.5165911638754248
+  },
+  "test_metrics": {
+    "cross_entropy": 1.6543842097859338,
+    "acc_exact": 0.4166666666666667,
+    "acc_within_1": 0.6296296296296297,
+    "macro_f1": 0.4252845919050374
+  },
+  "search_summary": {
+    "total_trials": 108,
+    "search_space": {
+      "clip_percentile": [
+        95.0,
+        98.0,
+        99.0
+      ],
+      "learning_rate": [
+        0.001,
+        0.005,
+        0.01,
+        0.05
+      ],
+      "batch_size": [
+        8,
+        16,
+        32
+      ],
+      "hidden_dim": [
+        32,
+        64,
+        128
+      ]
+    }
+  },
+  "artifacts": [
+    "best_weights.json",
+    "svd_model.npz",
+    "pipeline_config.json",
+    "manifest.json",
+    "leaderboard.csv",
+    "training_report.md"
+  ]
+}

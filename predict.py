@@ -57,10 +57,8 @@ import numpy as np
 _ROOT_DIR = Path(__file__).resolve().parent
 _MODEL_DIR = _ROOT_DIR / "model"
 _PREPROCESSING_DIR = _MODEL_DIR / "preprocessing"
-_TRAINING_DIR = _MODEL_DIR / "training"
-_MLP_DIR = _MODEL_DIR / "mlp"
 
-for p in (_MODEL_DIR, _PREPROCESSING_DIR, _TRAINING_DIR, _MLP_DIR):
+for p in (_MODEL_DIR, _PREPROCESSING_DIR):
     if p.exists() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -124,7 +122,7 @@ def load_image(image_path: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]
 
 @dataclass
 class ModelParameters:
-    """พารามิเตอร์ทั้งหมดที่ใช้ในการทำงานของระบบ"""
+    """พารามิเตอร์ทั้งหมดที่ใช้ในการทำงานของระบบ (Multi-Class Classification MLP)"""
     # Preprocessing Parameters
     resize_target: Tuple[int, int] = (512, 512)
     blur_ksize: int = 5
@@ -137,11 +135,18 @@ class ModelParameters:
     svd_vt: Optional[np.ndarray] = field(default=None, repr=False)
     svd_s: Optional[np.ndarray] = field(default=None, repr=False)
 
-    # MLP / Model Parameters
-    k: float = 10.0
-    W: Optional[np.ndarray] = field(default=None, repr=False)
-    b: Optional[np.ndarray] = field(default=None, repr=False)
+    # Multi-class MLP Parameters (67 -> 32 -> 9)
+    model_type: str = "multi_class_mlp"
+    n_classes: int = 9
+    hidden_dim: int = 32
+    n_stat_features: int = 3
     weight_init: str = "xavier"
+    W1: Optional[np.ndarray] = field(default=None, repr=False)
+    b1: Optional[np.ndarray] = field(default=None, repr=False)
+    W2: Optional[np.ndarray] = field(default=None, repr=False)
+    b2: Optional[np.ndarray] = field(default=None, repr=False)
+    stat_mean: Optional[np.ndarray] = field(default=None, repr=False)
+    stat_std: Optional[np.ndarray] = field(default=None, repr=False)
 
     # Metadata
     session_dir: Optional[Path] = None
@@ -149,7 +154,7 @@ class ModelParameters:
 
     @classmethod
     def from_session_dir(cls, session_dir: Union[str, Path]) -> "ModelParameters":
-        """โหลด Parameters และ Weights ทั้งหมดจากโฟลเดอร์ session ของ Model Registry"""
+        """โหลด Parameters และ Weights สำหรับโมเดล Multi-Class MLP จากโฟลเดอร์ session"""
         s_dir = Path(session_dir).resolve()
         if not s_dir.is_dir():
             raise FileNotFoundError(f"[ModelParameters] ไม่พบโฟลเดอร์ session: {s_dir}")
@@ -183,17 +188,28 @@ class ModelParameters:
         with open(weights_file, "r", encoding="utf-8") as f:
             w_data = json.load(f)
 
-        W = np.array(w_data["W"], dtype=np.float32)
-        b = np.array(w_data["b"], dtype=np.float32)
-        k = float(w_data.get("k", mdl_cfg.get("k", 10.0)))
         arch = w_data.get("architecture", {})
         weight_init = arch.get("weight_init", "xavier")
+
+        if not ("W1" in w_data and "b1" in w_data and "W2" in w_data and "b2" in w_data):
+            raise ValueError(f"โฟลเดอร์ {s_dir.name} ขาดค่าน้ำหนัก Multi-class MLP (W1, b1, W2, b2)")
+
+        W1 = np.array(w_data["W1"], dtype=np.float32)
+        b1 = np.array(w_data["b1"], dtype=np.float32)
+        W2 = np.array(w_data["W2"], dtype=np.float32)
+        b2 = np.array(w_data["b2"], dtype=np.float32)
+        detected_model_type = arch.get("model_type", "multi_class_mlp")
+        n_classes = int(arch.get("n_classes", mdl_cfg.get("n_classes", b2.shape[-1])))
+        hidden_dim = int(arch.get("hidden_dim", W1.shape[-1] if W1.ndim > 1 else 32))
+        n_stat_features_val = int(mdl_cfg.get("n_stat_features", 3))
 
         # 3. Load svd_model.npz
         svd_npz = np.load(svd_file)
         svd_mean = svd_npz["mean"].astype(np.float32)
         svd_vt = svd_npz["Vt"].astype(np.float32)
         svd_s = svd_npz["S"].astype(np.float32) if "S" in svd_npz else None
+        stat_mean = svd_npz["stat_mean"].astype(np.float32) if "stat_mean" in svd_npz else None
+        stat_std = svd_npz["stat_std"].astype(np.float32) if "stat_std" in svd_npz else None
 
         # 4. Load manifest.json (Optional)
         manifest = None
@@ -213,10 +229,17 @@ class ModelParameters:
             svd_mean=svd_mean,
             svd_vt=svd_vt,
             svd_s=svd_s,
-            k=k,
-            W=W,
-            b=b,
             weight_init=weight_init,
+            model_type=detected_model_type,
+            n_classes=n_classes,
+            hidden_dim=hidden_dim,
+            n_stat_features=n_stat_features_val,
+            W1=W1,
+            b1=b1,
+            W2=W2,
+            b2=b2,
+            stat_mean=stat_mean,
+            stat_std=stat_std,
             session_dir=s_dir,
             manifest=manifest,
         )
@@ -253,14 +276,16 @@ LAPLACIAN_KERNEL_3X3 = np.array(
     dtype=np.float32,
 )
 
-def sigmoid(z: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
-    """Standard Logistic Sigmoid: sigma(z) = 1 / (1 + exp(-z))"""
-    return 1.0 / (1.0 + np.exp(-z))
+def softmax(x: np.ndarray) -> np.ndarray:
+    """Numerically stable Softmax: softmax(x)_i = exp(x_i - max(x)) / sum(exp(x - max(x)))"""
+    x_shifted = x - np.max(x)
+    exp_x = np.exp(x_shifted)
+    return exp_x / np.sum(exp_x)
 
 
 @dataclass
 class TheoreticalAnalysis:
-    """รวมค่าและสถิติทั้งหมดที่คำนวณได้ตามหลักทฤษฎีในแต่ละช่วงของโมเดล"""
+    """รวมค่าและสถิติทั้งหมดที่คำนวณได้ตามหลักทฤษฎีในแต่ละช่วงของโมเดล Multi-Class MLP"""
 
     # ── 1. Spatial Domain & Preprocessing ──
     raw_dimensions: Tuple[int, int, int]
@@ -294,38 +319,41 @@ class TheoreticalAnalysis:
     reconstruction_relative_error: float # ||x - x_hat||_2 / ||x||_2
     subspace_fidelity_score: float      # 1 - relative_error
 
-    # ── 3. Neural Activation & Dynamics ──
-    weight_l2_norm: float
-    bias_value: float
-    cosine_similarity_z_w: float        # alignment ระหว่าง latent vector กับ weights
+    # ── 3. Multi-Class MLP Neural Dynamics & Activation ──
+    model_type: str = "multi_class_mlp"
+    weight_l2_norm: float = 0.0         # ||W1||_F
+    bias_value: float = 0.0             # mean(b1)
+    cosine_similarity_z_w: float = 0.0  # cos(theta) alignment
+    continuous_prediction: float = 0.0  # Expected box count E[Y] = sum(i * p_i)
 
-    logit_z: float                      # z = x_svd . W + b
-    standard_sigmoid: float             # sigma(z) in (0, 1)
-    scaled_sigmoid_k: float             # k factor
-
-    continuous_prediction: float        # y_hat = k * sigma(z)
-    theoretical_sensitivity: float      # dy_hat / dz = k * sigma(z) * (1 - sigma(z))
-    theoretical_curvature: float        # d^2 y_hat / dz^2
-
-    top_positive_features: List[Dict[str, Any]] # ฟีเจอร์ที่ดันให้จำนวนกล่องเพิ่ม (z_j * W_j > 0)
-    top_negative_features: List[Dict[str, Any]] # ฟีเจอร์ที่ดึงให้จำนวนกล่องลดลง (z_j * W_j < 0)
+    class_probabilities: List[float] = field(default_factory=list)  # 9 softmax probabilities
+    predicted_class: int = 0            # argmax index (0 to 8)
+    expected_value: float = 0.0         # E[Y] (1 to 9 boxes)
+    top_2_classes: List[Dict[str, Any]] = field(default_factory=list)
+    class_distribution: List[Dict[str, Any]] = field(default_factory=list)
+    top_predictions: List[Dict[str, Any]] = field(default_factory=list)
+    entropy: float = 0.0                # Shannon entropy in bits
+    stat_features_raw: List[float] = field(default_factory=list)
+    stat_features_normalized: List[float] = field(default_factory=list)
 
     # ── 4. Decision & Uncertainty ──
-    discrete_prediction: int            # round(y_hat)
-    prediction_floor: int               # floor(y_hat)
-    prediction_ceil: int                # ceil(y_hat)
-    rounding_ambiguity: float           # 2 * |y_hat - round(y_hat)| in [0, 1] (0=มั่นใจมาก, 1=ก้ำกึ่ง .5)
-    decision_confidence: float          # 1 - ambiguity in [0, 1]
+    discrete_prediction: int = 0        # argmax box count (1 to 9)
+    prediction_floor: int = 0           # floor(E[Y])
+    prediction_ceil: int = 0            # ceil(E[Y])
+    decision_confidence: float = 0.0    # Top Softmax probability in [0, 1]
 
 
 @dataclass
 class PredictionOutput:
-    """ผลลัพธ์สุดท้ายของการทำนาย"""
+    """ผลลัพธ์สุดท้ายของการทำนาย (Multi-Class Classification)"""
     image_path: str
-    predicted_box_count: int            # ผลลัพธ์จำนวนกล่องเต็ม (Discrete Answer)
-    continuous_box_count: float         # ค่าทำนายต่อเนื่อง (Continuous Output)
-    decision_confidence: float          # ความมั่นใจในการตัดสินใจ (0.0 - 1.0)
+    predicted_box_count: int            # ผลลัพธ์จำนวนกล่องเต็ม 1–9 กล่อง (Discrete Answer)
+    continuous_box_count: float         # ค่าคาดหวังทางสถิติ E[Y] (Expected Value)
+    decision_confidence: float          # ความมั่นใจในการตัดสินใจ (Top Softmax Probability)
     theoretical_values: TheoreticalAnalysis
+    model_type: str = "multi_class_mlp"
+    top_predictions: Optional[List[Dict[str, Any]]] = None
+    class_distribution: Optional[List[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """แปลงเป็น dict สำหรับบันทึก JSON หรือส่งผ่าน API"""
@@ -338,7 +366,7 @@ class PredictionOutput:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BoxPredictor:
-    """เครื่องมือประมวลผล ทำนายผล และสกัดค่าทางทฤษฎีจากภาพพัสดุ"""
+    """เครื่องมือประมวลผล ทำนายผล และสกัดค่าทางทฤษฎีจากภาพพัสดุ (Multi-Class MLP)"""
 
     def __init__(self, params: ModelParameters):
         self.params = params
@@ -348,8 +376,8 @@ class BoxPredictor:
         p = self.params
         if p.svd_mean is None or p.svd_vt is None:
             raise ValueError("[BoxPredictor] ขาดข้อมูล SVD (mean หรือ Vt) ใน ModelParameters")
-        if p.W is None or p.b is None:
-            raise ValueError("[BoxPredictor] ขาดค่าน้ำหนัก (W หรือ b) ใน ModelParameters")
+        if p.W1 is None or p.b1 is None or p.W2 is None or p.b2 is None:
+            raise ValueError("[BoxPredictor] ขาดค่าน้ำหนัก Multi-class MLP (W1, b1, W2, หรือ b2)")
 
     @classmethod
     def from_session(cls, session_dir: Union[str, Path]) -> "BoxPredictor":
@@ -473,63 +501,128 @@ class BoxPredictor:
             if total_s_energy > 1e-8:
                 singular_energy_ratio = float(np.sum(p.svd_s[:p.n_svd_features] ** 2) / total_s_energy)
 
-        # ── Step 7: Neural Forward Pass (MLP Scaled Sigmoid) ──
-        W = p.W.reshape(-1)  # shape (n_features,)
-        b = float(p.b.reshape(-1)[0])
-        w_norm = float(np.linalg.norm(W))
+        # ── Step 7: Neural Forward Pass ──
+        # Classification and regression fields (initialized with defaults)
+        logit = None
+        sig = None
+        scaled_k = None
+        dy_dz = 0.0
+        d2y_dz2 = 0.0
+        top_pos: List[Dict[str, Any]] = []
+        top_neg: List[Dict[str, Any]] = []
+        class_probs_list: Optional[List[float]] = None
+        predicted_cls: Optional[int] = None
+        expected_val: Optional[float] = None
+        top_2_cls: Optional[List[Dict[str, Any]]] = None
+        class_distribution: Optional[List[Dict[str, Any]]] = None
+        top_predictions: Optional[List[Dict[str, Any]]] = None
+        entropy: Optional[float] = None
+        raw_stats_list: Optional[List[float]] = None
+        norm_stats_list: Optional[List[float]] = None
 
-        # Cosine similarity between latent vector z and weights W
-        z_norm = float(np.linalg.norm(z_vector))
-        if z_norm > 1e-7 and w_norm > 1e-7:
-            cos_sim = float(np.dot(z_vector, W) / (z_norm * w_norm))
+        # ── Step 7: Multi-Class MLP Forward Pass (67 -> 32 -> 9) ──
+        # 1. Edge Area (ratio of active edge pixels in edge map)
+        edge_area_ratio = float(np.count_nonzero(edge_map_uint8 > 0) / edge_map_uint8.size)
+
+        # 2. Contour Count feature (log1p of external contours)
+        contours, _ = cv2.findContours(edge_map_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_feat = float(np.log1p(len(contours)))
+
+        # 3. Aspect Ratio feature (w / h)
+        # Note: In the training pipeline (session_20261018_082656), images were resized to 512x512
+        # before feature extraction, giving an aspect ratio of 1.0 (mean 1.00003, std 0.00226).
+        # Computing aspect ratio from raw viewport dimensions (e.g. 400x300 -> 1.3333) creates a
+        # catastrophic +147 standard deviation outlier that overpowers the MLP and locks predictions to 1 box.
+        # We compute aspect ratio from the standardized receptive field (resized_512).
+        aspect_ratio_feat = float(resized_512.shape[1] / resized_512.shape[0]) if resized_512.shape[0] > 0 else 1.0
+
+        raw_stats = np.array([edge_area_ratio, contour_feat, aspect_ratio_feat], dtype=np.float32)
+        raw_stats_list = [round(float(v), 5) for v in raw_stats]
+
+        # Standardize statistical features using training set distribution (from svd_model.npz)
+        if p.stat_mean is not None and p.stat_std is not None:
+            raw_normalized = ((raw_stats - p.stat_mean) / (p.stat_std + 1e-7)).astype(np.float32)
+            # Clip to [-3.0, 3.0] to prevent out-of-distribution outlier explosions
+            stat_features = np.clip(raw_normalized, -3.0, 3.0)
+        else:
+            stat_features = raw_stats
+        norm_stats_list = [round(float(v), 5) for v in stat_features]
+
+        # Concatenate SVD features (64) + stat features (3) → input vector (67)
+        x_input = np.concatenate([z_vector, stat_features])  # shape (67,)
+
+        # Layer 1: hidden = relu(x @ W1 + b1)
+        W1 = p.W1  # shape (67, 32)
+        b1_vec = p.b1.reshape(-1)  # shape (32,)
+        hidden_pre = x_input @ W1 + b1_vec
+        hidden = np.maximum(0, hidden_pre)  # ReLU activation
+
+        # Layer 2: logits = hidden @ W2 + b2
+        W2 = p.W2  # shape (32, 9)
+        b2_vec = p.b2.reshape(-1)  # shape (9,)
+        logits = hidden @ W2 + b2_vec
+
+        # Softmax output: class probability distribution over 9 classes
+        probs = softmax(logits)  # shape (9,)
+
+        # In session_20261018_082656, classes 0..8 represent 1..9 boxes (1-indexed labels)
+        predicted_cls = int(np.argmax(probs))
+        discrete_count = predicted_cls + 1  # 1 to 9 boxes
+        confidence = float(probs[predicted_cls])
+
+        # Expected box count: sum((i + 1) * probs[i])
+        box_indices = np.arange(1, len(probs) + 1)
+        expected_val = float(np.sum(box_indices * probs))
+        y_hat = expected_val
+
+        # Shannon entropy in bits: -sum(p * log2(p))
+        entropy = float(-np.sum(probs * np.log2(np.clip(probs, 1e-12, 1.0))))
+
+        class_probs_list = [round(float(pr), 6) for pr in probs]
+
+        # Detailed class distribution (1 to 9 boxes)
+        class_distribution = [
+            {
+                "class_id": int(i),
+                "box_count": int(i + 1),
+                "probability": round(float(probs[i]), 5),
+                "percent": round(float(probs[i] * 100), 2),
+            }
+            for i in range(len(probs))
+        ]
+
+        # Top 3 ranked candidate predictions
+        sorted_ranks = np.argsort(probs)[::-1]
+        top_predictions = [
+            {
+                "rank": rank + 1,
+                "class_id": int(idx),
+                "box_count": int(idx + 1),
+                "probability": round(float(probs[idx]), 5),
+                "confidence_pct": round(float(probs[idx] * 100), 2),
+            }
+            for rank, idx in enumerate(sorted_ranks[:3])
+        ]
+        top_2_cls = [
+            {"class": int(item["box_count"]), "probability": item["probability"]}
+            for item in top_predictions[:2]
+        ]
+
+        # Weight norms for reporting
+        w_norm = float(np.linalg.norm(W1))
+        b_val = float(np.mean(b1_vec))
+
+        # Cosine similarity between input vector and first-layer weight mean direction
+        w1_mean_dir = np.mean(W1, axis=1)  # shape (67,)
+        x_norm_val = float(np.linalg.norm(x_input))
+        w1_dir_norm = float(np.linalg.norm(w1_mean_dir))
+        if x_norm_val > 1e-7 and w1_dir_norm > 1e-7:
+            cos_sim = float(np.dot(x_input, w1_mean_dir) / (x_norm_val * w1_dir_norm))
         else:
             cos_sim = 0.0
 
-        # Linear Logit: z_logit = z . W + b
-        logit = float(np.dot(z_vector, W) + b)
-
-        # Standard Sigmoid: sigma(z)
-        sig = float(sigmoid(logit))
-
-        # Scaled Prediction: y_hat = k * sigma(z)
-        y_hat = float(p.k * sig)
-
-        # Local Derivatives (Sensitivity & Curvature)
-        dy_dz = float(p.k * sig * (1.0 - sig))
-        d2y_dz2 = float(p.k * sig * (1.0 - sig) * (1.0 - 2.0 * sig))
-
-        # Feature Attribution: c_j = z_j * W_j
-        attributions = z_vector * W
-        sorted_indices = np.argsort(attributions)
-
-        # Top 5 positive contributors
-        top_pos = []
-        for idx in reversed(sorted_indices[-5:]):
-            top_pos.append({
-                "feature_index": int(idx),
-                "z_value": round(float(z_vector[idx]), 5),
-                "weight": round(float(W[idx]), 5),
-                "contribution": round(float(attributions[idx]), 5),
-            })
-
-        # Top 5 negative contributors
-        top_neg = []
-        for idx in sorted_indices[:5]:
-            top_neg.append({
-                "feature_index": int(idx),
-                "z_value": round(float(z_vector[idx]), 5),
-                "weight": round(float(W[idx]), 5),
-                "contribution": round(float(attributions[idx]), 5),
-            })
-
-        # ── Step 8: Discrete Decision & Uncertainty ──
-        discrete_count = int(np.clip(round(y_hat), 0, round(p.k)))
         pred_floor = int(np.floor(y_hat))
         pred_ceil = int(np.ceil(y_hat))
-
-        # Rounding ambiguity (0 = exact integer, 1 = maximum ambiguity at .5)
-        ambiguity = float(2.0 * abs(y_hat - round(y_hat)))
-        confidence = float(max(0.0, min(1.0, 1.0 - ambiguity)))
 
         # ── Step 9: Assemble Theoretical Analysis Package ──
         analysis = TheoreticalAnalysis(
@@ -558,21 +651,23 @@ class BoxPredictor:
             reconstruction_residual_l2=round(residual_l2, 4),
             reconstruction_relative_error=round(relative_error, 4),
             subspace_fidelity_score=round(fidelity_score, 4),
+            model_type=p.model_type,
             weight_l2_norm=round(w_norm, 4),
-            bias_value=round(b, 4),
+            bias_value=round(b_val, 4),
             cosine_similarity_z_w=round(cos_sim, 4),
-            logit_z=round(logit, 5),
-            standard_sigmoid=round(sig, 5),
-            scaled_sigmoid_k=p.k,
             continuous_prediction=round(y_hat, 4),
-            theoretical_sensitivity=round(dy_dz, 5),
-            theoretical_curvature=round(d2y_dz2, 5),
-            top_positive_features=top_pos,
-            top_negative_features=top_neg,
+            class_probabilities=class_probs_list,
+            predicted_class=predicted_cls,
+            expected_value=round(expected_val, 4),
+            top_2_classes=top_2_cls,
+            class_distribution=class_distribution,
+            top_predictions=top_predictions,
+            entropy=round(entropy, 4),
+            stat_features_raw=raw_stats_list,
+            stat_features_normalized=norm_stats_list,
             discrete_prediction=discrete_count,
             prediction_floor=pred_floor,
             prediction_ceil=pred_ceil,
-            rounding_ambiguity=round(ambiguity, 4),
             decision_confidence=round(confidence, 4),
         )
 
@@ -582,6 +677,9 @@ class BoxPredictor:
             continuous_box_count=round(y_hat, 4),
             decision_confidence=round(confidence, 4),
             theoretical_values=analysis,
+            model_type=p.model_type,
+            top_predictions=top_predictions,
+            class_distribution=class_distribution,
         )
 
         # ── Step 10: Optionally Save Intermediate Visual Steps ──
@@ -622,23 +720,27 @@ def print_pretty_report(output: PredictionOutput, params: ModelParameters) -> No
     print("\n【 1. ผลลัพธ์การทำนาย (FINAL PREDICTION ANSWER) 】")
     print(f"  • รูปภาพเป้าหมาย         : {Path(output.image_path).name}")
     print(f"  • เส้นทางไฟล์ (Path)      : {output.image_path}")
-    print(f"  • 🎯 คำตอบจำนวนกล่องพัสดุ:  >>> {output.predicted_box_count} กล่อง <<<  (จำนวนเต็ม)")
-    print(f"  • ค่าทำนายต่อเนื่อง (y_hat) : {output.continuous_box_count:.4f} กล่อง (สเกล [0, {t.scaled_sigmoid_k:.1f}])")
+    print(f"  • 🎯 คำตอบจำนวนกล่องพัสดุ:  >>> {output.predicted_box_count} กล่อง <<<  (จำนวนเต็ม 1–9)")
+    print(f"  • ค่าคาดหวัง (Expected E[Y]): {output.continuous_box_count:.4f} กล่อง (สเกล [1.0, {params.n_classes}.0])")
     print(f"  • ช่วงจำนวนที่เป็นไปได้   : [{t.prediction_floor}, {t.prediction_ceil}] กล่อง")
-    print(f"  • ระดับความมั่นใจ (Conf) : {output.decision_confidence * 100:.1f}% (Ambiguity index = {t.rounding_ambiguity:.3f})")
+    print(f"  • ระดับความมั่นใจ (Conf) : {output.decision_confidence * 100:.1f}% (Top Softmax probability)")
+    print(f"  • ประเภทโมเดล            : Multi-Class Classification ({params.n_classes} classes: 1–9 boxes)")
 
     # ── 2. Active Parameters ──
     print("\n【 2. พารามิเตอร์ที่ใช้ในการทำงาน (ACTIVE PARAMETERS) 】")
     if params.session_dir:
         print(f"  • โฟลเดอร์ Session       : {params.session_dir.name}")
+    print(f"  • Model Type             : {params.model_type}")
     print(f"  • Resize Target          : {params.resize_target[0]}×{params.resize_target[1]} px")
     print(f"  • Gaussian Blur Kernel   : {params.blur_ksize}×{params.blur_ksize}")
     print(f"  • Outlier Percentile Clip: {params.clip_percentile:.1f}%")
     print(f"  • SVD Input Resolution   : {params.image_size_svd}×{params.image_size_svd} px (Total {t.pixel_vector_dim} pixels)")
     print(f"  • SVD Latent Dimension   : {params.n_svd_features} Components (Represented as 8×8 Matrix)")
-    print(f"  • Scaled Sigmoid Max (k) : {params.k:.1f}")
-    print(f"  • Weight Vector L2 Norm  : {t.weight_l2_norm:.4f}")
-    print(f"  • Bias Value (b)         : {t.bias_value:.4f}")
+    print(f"  • MLP Architecture       : {params.n_svd_features + params.n_stat_features} → {params.hidden_dim} (ReLU) → {params.n_classes} (Softmax)")
+    print(f"  • Stat Features          : {params.n_stat_features} (edge_area_ratio, contour_count_log, aspect_ratio)")
+    print(f"  • Number of Classes      : {params.n_classes} classes (1 to 9 boxes)")
+    print(f"  • Weight W1 L2 Norm      : {t.weight_l2_norm:.4f}")
+    print(f"  • Mean Bias Value (b1)   : {t.bias_value:.4f}")
 
     # ── 3. Spatial Domain & Edge Theory ──
     print("\n【 3. ค่าทางทฤษฎีด้านภาพและเส้นขอบ (SPATIAL & EDGE DOMAIN) 】")
@@ -662,24 +764,32 @@ def print_pretty_report(output: PredictionOutput, params: ModelParameters) -> No
     if t.svd_singular_energy_ratio:
         print(f"  • อัตราพลังงาน Singular  : {t.svd_singular_energy_ratio * 100:.2f}% ครอบคลุมใน {t.n_svd_components} องค์ประกอบ")
 
-    # ── 5. Neural Activation & Dynamics Theory ──
-    print("\n【 5. ค่าทางทฤษฎีประสาทเทียมและการกระตุ้น (NEURAL ACTIVATION DYNAMICS) 】")
-    print(f"  • Cosine Alignment (z, W): cos(θ) = {t.cosine_similarity_z_w:.4f}")
-    print(f"  • ผลรวมเชิงเส้น (Logit z): z = z·W + b = {t.logit_z:.5f}")
-    print(f"  • ค่าฟังก์ชัน Sigmoid (σ): σ(z) = 1/(1+e⁻ᶻ) = {t.standard_sigmoid:.5f}  (ช่วง (0, 1))")
-    print(f"  • ค่าทำนายสเกล k·σ(z)    : {t.scaled_sigmoid_k:.1f} × {t.standard_sigmoid:.5f} = {t.continuous_prediction:.4f}")
-    print(f"  • อัตราความไวเฉพาะที่    : dy_hat/dz = k·σ(1-σ) = {t.theoretical_sensitivity:.5f} กล่อง/logit")
-    print(f"  • ความโค้ง (Curvature)   : d²y_hat/dz² = {t.theoretical_curvature:.5f}")
+    # ── 5. Multi-Class Classification & Probabilities ──
+    print("\n【 5. ค่าทางทฤษฎีการจำแนกหลายคลาส (MULTI-CLASS CLASSIFICATION & PROBABILITIES) 】")
+    print(f"  • Cosine Alignment (x, W1) : cos(θ) = {t.cosine_similarity_z_w:.4f}")
+    print(f"  • ค่าคาดหวังทางสถิติ (E[Y]) : {t.continuous_prediction:.4f} กล่อง")
+    print(f"  • Shannon Entropy (ความไม่แน่นอน): {t.entropy:.4f} bits")
+    if t.stat_features_raw:
+        print(f"  • Statistical Features (Raw): Edge Area={t.stat_features_raw[0]:.4f}, Contour Count Log={t.stat_features_raw[1]:.4f}, Aspect Ratio={t.stat_features_raw[2]:.4f}")
+    if t.stat_features_normalized:
+        print(f"  • Statistical Features (Norm): [{', '.join(f'{v:+.3f}' for v in t.stat_features_normalized)}]")
 
-    # ── 6. Top Feature Attributions ──
-    print("\n【 6. การแจกแจงอิทธิพลของแต่ละ SVD Component (TOP ATTRIBUTIONS) 】")
-    print("  ▲ องค์ประกอบที่มีผลบวกมากที่สุด (ผลักดันให้จำนวนกล่องเพิ่มขึ้น):")
-    for item in t.top_positive_features:
-        print(f"    - SVD Component #{item['feature_index']:02d}: z = {item['z_value']:+.4f}, W = {item['weight']:+.4f} → Contribution = {item['contribution']:+.5f}")
+    print("\n  📊 ตารางการแจกแจงความน่าจะเป็นของแต่ละคลาส (Probability Distribution 1–9 กล่อง):")
+    if t.class_distribution:
+        for item in t.class_distribution:
+            boxes = item["box_count"]
+            prob = item["probability"]
+            pct = item["percent"]
+            bar_len = int(round(prob * 35))
+            bar_str = "█" * bar_len + "░" * (35 - bar_len)
+            winner_tag = " ★ [PREDICTED]" if boxes == output.predicted_box_count else ""
+            print(f"    • {boxes} กล่อง : {prob:7.4f} ({pct:5.1f}%) |{bar_str}|{winner_tag}")
 
-    print("  ▼ องค์ประกอบที่มีผลลบมากที่สุด (ดึงให้จำนวนกล่องลดลง):")
-    for item in t.top_negative_features:
-        print(f"    - SVD Component #{item['feature_index']:02d}: z = {item['z_value']:+.4f}, W = {item['weight']:+.4f} → Contribution = {item['contribution']:+.5f}")
+    # ── 6. Top Ranked Candidates ──
+    print("\n【 6. อันดับความเป็นไปได้สูงสุด (TOP RANKED CANDIDATES) 】")
+    if t.top_predictions:
+        for p_cand in t.top_predictions:
+            print(f"  ▲ อันดับ {p_cand['rank']}: {p_cand['box_count']} กล่อง — ความน่าจะเป็น {p_cand['confidence_pct']:.2f}% (P={p_cand['probability']:.5f})")
 
     print("\n" + "=" * 76 + "\n")
 
@@ -690,7 +800,7 @@ def print_pretty_report(output: PredictionOutput, params: ModelParameters) -> No
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Parcel Box Counter — Inference & Theoretical Analysis Engine",
+        description="Parcel Box Counter — Inference & Theoretical Analysis Engine (Multi-Class MLP)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -719,7 +829,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── Parameter Overrides ──
-    parser.add_argument("--k", type=float, default=None, help="Override ค่า k (เพดานจำนวนกล่อง)")
     parser.add_argument("--clip-percentile", type=float, default=None, help="Override เปอร์เซ็นไทล์ตัดขอบ")
     parser.add_argument("--blur-ksize", type=int, default=None, help="Override ขนาด blur kernel")
 
@@ -766,6 +875,11 @@ def main():
             pre_cfg = cfg.get("preprocessing", {})
             mdl_cfg = cfg.get("model", {})
 
+            W1 = np.array(w_data["W1"], dtype=np.float32)
+            b1 = np.array(w_data["b1"], dtype=np.float32)
+            W2 = np.array(w_data["W2"], dtype=np.float32)
+            b2 = np.array(w_data["b2"], dtype=np.float32)
+
             params = ModelParameters(
                 resize_target=tuple(pre_cfg.get("resize_target", [512, 512])),  # type: ignore
                 blur_ksize=int(pre_cfg.get("blur_ksize", 5)),
@@ -775,17 +889,22 @@ def main():
                 svd_mean=svd_npz["mean"].astype(np.float32),
                 svd_vt=svd_npz["Vt"].astype(np.float32),
                 svd_s=svd_npz["S"].astype(np.float32) if "S" in svd_npz else None,
-                k=float(w_data.get("k", 10.0)),
-                W=np.array(w_data["W"], dtype=np.float32),
-                b=np.array(w_data["b"], dtype=np.float32),
+                stat_mean=svd_npz["stat_mean"].astype(np.float32) if "stat_mean" in svd_npz else None,
+                stat_std=svd_npz["stat_std"].astype(np.float32) if "stat_std" in svd_npz else None,
+                model_type="multi_class_mlp",
+                n_classes=int(w_data.get("architecture", {}).get("n_classes", 9)),
+                hidden_dim=int(w_data.get("architecture", {}).get("hidden_dim", 32)),
+                n_stat_features=int(mdl_cfg.get("n_stat_features", 3)),
+                W1=W1,
+                b1=b1,
+                W2=W2,
+                b2=b2,
             )
         else:
             # Try finding latest session automatically
             params = ModelParameters.find_latest_session()
 
         # Apply any explicit CLI overrides
-        if args.k is not None:
-            params.k = args.k
         if args.clip_percentile is not None:
             params.clip_percentile = args.clip_percentile
         if args.blur_ksize is not None:

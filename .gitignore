@@ -6,3 +6,14 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Local / Test Artifacts
+.aistudio/artifacts/
+model/augmentation/output_test/
+

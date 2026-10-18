@@ -28,6 +28,15 @@ export interface CountBoxesApiResponse {
     inferenceTimeMs: number;
     details?: any;
     rawModelResponse: any;
+    modelType?: string;
+    expectedCount?: number;
+    topPredictions?: Array<{
+      class: number;
+      label: string;
+      probability: number;
+    }>;
+    classDistribution?: Record<string, number>;
+    entropy?: number;
   };
   matrixDetails: {
     inputParams: TransformParams;
@@ -47,8 +56,6 @@ export interface CountBoxesApiResponse {
       cropHeight: string;
     };
   };
-  isMockFallback: boolean;
-  fallbackReason?: string;
   error?: string;
 }
 
@@ -108,7 +115,7 @@ export async function processBoxCounting(
     croppedImageBase64,
     modelResult: {
       boxCount: modelCall.data.count ?? modelCall.data.box_count ?? modelCall.data.boxes?.length ?? 0,
-      continuousBoxCount: modelCall.data.continuous ?? modelCall.data.box_count ?? 0,
+      continuousBoxCount: modelCall.data.continuous ?? modelCall.data.expected_count ?? modelCall.data.box_count ?? 0,
       confidence: modelCall.data.confidence ?? 0.94,
       boxes: modelCall.data.boxes || [],
       annotatedImageBase64: modelCall.data.annotated_image_base64,
@@ -120,6 +127,11 @@ export async function processBoxCounting(
       inferenceTimeMs: modelCall.data.inference_time_ms || 35,
       details: modelCall.data.details,
       rawModelResponse: modelCall.data.raw || modelCall.data,
+      modelType: modelCall.data.model_type || modelCall.data.raw?.model_type,
+      expectedCount: modelCall.data.expected_count ?? modelCall.data.raw?.expected_count,
+      topPredictions: modelCall.data.top_predictions || modelCall.data.raw?.top_predictions,
+      classDistribution: modelCall.data.class_distribution || modelCall.data.raw?.class_distribution,
+      entropy: modelCall.data.entropy ?? modelCall.data.raw?.entropy,
     },
     matrixDetails: {
       inputParams: transformParams,
@@ -139,8 +151,6 @@ export async function processBoxCounting(
         cropHeight: `Math.round(viewportH / scale) = Math.round(${transformParams.viewportH} / ${transformParams.scale}) = ${crop.rawHeight}px -> clamped: ${crop.height}px`,
       },
     },
-    isMockFallback: modelCall.isMockFallback,
-    fallbackReason: modelCall.fallbackReason,
   };
 }
 

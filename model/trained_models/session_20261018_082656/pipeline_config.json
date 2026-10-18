@@ -5,18 +5,23 @@
       512
     ],
     "blur_ksize": 5,
-    "clip_percentile": 95.0,
+    "clip_percentile": 98.0,
     "image_size_svd": 128
   },
   "training": {
     "learning_rate": 0.01,
     "batch_size": 32,
+    "hidden_dim": 32,
     "max_epochs": 500,
     "weight_init": "xavier",
-    "patience": 25
+    "patience": 30,
+    "dropout_rate": 0.3
   },
   "model": {
-    "k": 8.0,
-    "n_svd_features": 64
+    "model_type": "multi_class_mlp",
+    "n_classes": 9,
+    "n_svd_features": 64,
+    "n_stat_features": 3,
+    "input_dim": 67
   }
 }

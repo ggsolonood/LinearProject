@@ -19,7 +19,7 @@ import { ViewportInspector } from './components/ViewportInspector';
 import { CameraModal } from './components/CameraModal';
 import { ResultsDashboard } from './components/ResultsDashboard';
 import { MatrixLogViewer } from './components/MatrixLogViewer';
-import { generateSamplePalletSvg, dataUrlToFile } from './utils/sampleImages';
+import { generateSamplePalletSvg, dataUrlToFile, loadSampleBoxFile } from './utils/sampleImages';
 import type { CountBoxesApiResponse } from './types';
 
 export default function SmartBoxCounterApp() {
@@ -44,7 +44,7 @@ export default function SmartBoxCounterApp() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    loadDefaultSample('pallet');
+    loadDefaultSample('box1');
     fetchModelStatus();
   }, []);
 
@@ -60,8 +60,24 @@ export default function SmartBoxCounterApp() {
     }
   };
 
-  const loadDefaultSample = async (type: 'pallet' | 'crates' | 'shipping') => {
+  const loadDefaultSample = async (type: 'box1' | 'pallet' | 'crates' | 'shipping' = 'box1') => {
     try {
+      if (type === 'box1') {
+        const sample = await loadSampleBoxFile();
+        setImageFile(sample.file);
+        setImageSrc(sample.url);
+        setNaturalWidth(sample.width);
+        setNaturalHeight(sample.height);
+
+        const fitScale = Math.min(viewportW / sample.width, viewportH / sample.height);
+        setScale(fitScale);
+        setTranslateX(Math.round((viewportW - sample.width * fitScale) / 2));
+        setTranslateY(Math.round((viewportH - sample.height * fitScale) / 2));
+        setAnalysisResult(null);
+        setErrorMessage(null);
+        return;
+      }
+
       const sampleSvg = generateSamplePalletSvg(type);
       const file = await dataUrlToFile(sampleSvg, `warehouse_${type}_sample.svg`);
       setImageFile(file);
@@ -247,7 +263,14 @@ export default function SmartBoxCounterApp() {
               <span className="text-[10px] font-mono text-slate-400 uppercase block font-semibold">
                 Instant Warehouse Demos:
               </span>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => loadDefaultSample('box1')}
+                  className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-[11px] font-mono text-amber-300 border border-amber-500/50 font-semibold transition flex items-center gap-1.5"
+                >
+                  <span>📦</span> 1 Box (Single)
+                </button>
                 <button
                   type="button"
                   onClick={() => loadDefaultSample('pallet')}

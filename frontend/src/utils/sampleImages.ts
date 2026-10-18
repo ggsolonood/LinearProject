@@ -151,3 +151,19 @@ export async function dataUrlToFile(dataUrl: string, filename: string): Promise<
   const blob = await res.blob();
   return new File([blob], filename, { type: blob.type || 'image/svg+xml' });
 }
+
+import sampleBoxUrl from '../assets/sample_box.jpg';
+export { sampleBoxUrl };
+
+export async function loadSampleBoxFile(): Promise<{ file: File; url: string; width: number; height: number }> {
+  const res = await fetch(sampleBoxUrl);
+  const blob = await res.blob();
+  const file = new File([blob], 'sample_box_1.jpg', { type: 'image/jpeg' });
+  return {
+    file,
+    url: sampleBoxUrl,
+    width: 1024,
+    height: 1024,
+  };
+}
+
